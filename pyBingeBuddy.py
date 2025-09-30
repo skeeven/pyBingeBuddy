@@ -6,7 +6,7 @@ import datetime
 import smtplib
 from email.mime.text import MIMEText
 from typing import Optional, List, Dict, Any, cast
-
+import bcrypt
 import streamlit as st
 
 # Optional SMS
@@ -19,6 +19,7 @@ import streamlit as st
 # Config
 # ----------------------------
 APP_DB = "shows.db"
+DEBUG_ON = False # True
 TMDB_BASE = "https://api.themoviedb.org/3"
 
 # Try .env (local dev) then Streamlit secrets
@@ -32,11 +33,14 @@ def _get_secret(key: str, default: str = "") -> str:
     # tolerate missing st.secrets during local runs
     try:
         return os.getenv(key) or st.secrets.get(key, default)
-    except Exception:
+    except ImportError:
         return default
 
+
+# environment debug
+ENVIRON = _get_secret("ENVIRONMENT")
 # TMDB env
-DEFAULT_API_KEY = _get_secret("TMDB_API_KEY")
+DEFAULT_API_KEY = _get_secret("DEFAULT_API_KEY")
 # Email env
 SMTP_HOST = _get_secret("SMTP_HOST")
 SMTP_PORT = int(_get_secret("SMTP_PORT", "587"))
@@ -62,6 +66,80 @@ sc_dbname = _get_secret("SQLITE_DB")
 sql_api_key = _get_secret("SQLITE_API_KEY")
 
 
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def check_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+def track_show_for_user(conn, show_id: int):
+    user_id = st.session_state["user_id"]
+    conn.execute(
+        "INSERT OR IGNORE INTO user_shows (user_id, show_id) VALUES (?, ?)",
+        (user_id, show_id),
+    )
+    conn.commit()
+
+
+def get_user_shows(conn):
+    user_id = st.session_state["user_id"]
+    cur = conn.execute(
+        "SELECT s.id, s.name, s.status, s.next_air_date "
+        "FROM shows s "
+        "JOIN user_shows us ON s.id = us.show_id "
+        "WHERE us.user_id = ?",
+        (user_id,)
+    )
+    return cur.fetchall()
+
+
+def login_screen(conn):
+    st.title("🔐 Login")
+    st.write("Environment: ", ENVIRON)
+    tab_login, tab_signup = st.tabs(["Login", "Create Account"])
+
+    with tab_login:
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            cur = conn.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
+            row = cur.fetchone()
+            if row and check_password(password, row[1]):
+                st.session_state["user_id"] = row[0]
+                st.session_state["user_email"] = email
+                st.success("Login successful!")
+                # Run sync right after login
+                updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"],
+                                                                          sql_api_key, DEFAULT_API_KEY)
+                st.info(f"Synced {updated_count} shows • {email_count} emails • {sms_count} SMS")
+
+                st.rerun()
+            else:
+                st.error("Invalid email or password")
+
+    with tab_signup:
+        email = st.text_input("New Email", key="signup_email")
+        password = st.text_input("New Password", type="password", key="signup_password")
+        phone = st.text_input("Phone (optional)")
+        carrier = st.selectbox("Carrier", ["", "AT&T", "Verizon", "T-Mobile", "Sprint"])
+        enable_email = st.checkbox("Enable Email Alerts", value=True)
+        enable_sms = st.checkbox("Enable SMS Alerts")
+
+        if st.button("Create Account"):
+            try:
+                conn.execute(
+                    "INSERT INTO users (email, phone, carrier, enable_email, enable_sms, password_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (email, phone, carrier, int(enable_email), int(enable_sms), hash_password(password)),
+                )
+                conn.commit()
+                st.success("Account created! Please login.")
+            except Exception as e:
+                st.error(f"Error creating account: {e}")
+
+
 # ----------------------------
 # DB Utilities
 # ----------------------------
@@ -75,8 +153,17 @@ def get_conn() -> sqlitecloud.Connection:
 
 
 def init_db(conn: sqlitecloud.Connection) -> None:
-    conn.executescript(
-        """
+    schema = """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT,
+            carrier TEXT,
+            enable_email INTEGER,
+            enable_sms INTEGER,
+            password_hash TEXT NOT NULL
+        );
+        
         CREATE TABLE IF NOT EXISTS shows (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             tmdb_id         INTEGER UNIQUE NOT NULL,
@@ -114,12 +201,24 @@ def init_db(conn: sqlitecloud.Connection) -> None:
             UNIQUE(show_id, season_number, episode_number)
         );
 
+        CREATE TABLE IF NOT EXISTS user_shows (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            show_id INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(show_id) REFERENCES shows(id),
+            UNIQUE(user_id, show_id)
+        );
+
         CREATE TABLE IF NOT EXISTS watches (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             episode_id      INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
             watched_at      TEXT NOT NULL,
             rating          INTEGER,
-            notes           TEXT
+            notes           TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(episode_id) REFERENCES episodes(id)
         );
 
         -- Persist alert recipients & preferences
@@ -132,22 +231,21 @@ def init_db(conn: sqlitecloud.Connection) -> None:
             email_enabled INTEGER DEFAULT 0,
             sms_enabled INTEGER DEFAULT 0
         );
-
-        INSERT OR IGNORE INTO alert_config (id, email_to, sms_to, email_enabled, sms_enabled)
-        VALUES (1, NULL, NULL, 0, 0);
+        
+        INSERT OR IGNORE INTO alert_config (id, email_to, sms_to, carrier, sms_via_email_enabled, 
+        email_enabled, sms_enabled)
+        VALUES (1, NULL, NULL, NULL, 0, 0, 0);
 
         CREATE INDEX IF NOT EXISTS idx_episodes_show ON episodes(show_id);
         CREATE INDEX IF NOT EXISTS idx_watches_episode ON watches(episode_id);
         """
-    )
-    conn.commit()
 
-    # Backfill alerted_next_air_date for existing rows
-    try:
-        conn.execute("SELECT alerted_next_air_date FROM shows LIMIT 1")
-    except sqlitecloud.OperationalError:
-        conn.execute("ALTER TABLE shows ADD COLUMN alerted_next_air_date TEXT")
-        conn.commit()
+    # Run statements one by one
+    for stmt in schema.split(";"):
+        stmt = stmt.strip()
+        if stmt:  # skip empty lines
+            conn.execute(stmt)
+    conn.commit()
 
 
 # ----------------------------
@@ -199,9 +297,13 @@ def tmdb_discover_tv(api_key: str, params: Dict[str, Any]) -> Dict[str, Any]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def tmdb_tv_details(tmdb_id: int, api_key: str) -> Dict[str, Any]:
     url = f"{TMDB_BASE}/tv/{tmdb_id}"
-    r = requests.get(url, headers=tmdb_headers(api_key), params=tmdb_params(api_key))
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, headers=tmdb_headers(api_key), params=tmdb_params(api_key))
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.error(f"TMDB API error for show {tmdb_id}: {e}")
+        return {}
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -216,7 +318,7 @@ def tmdb_season_details(tmdb_id: int, season_number: int, api_key: str) -> Dict[
 # Sync: TMDB -> SQLite
 # ----------------------------
 def upsert_show(conn: sqlitecloud.Connection, details: Dict[str, Any]) -> int:
-    next_air_date = None
+    next_air_date = {}
     if details.get("next_episode_to_air"):
         next_air_date = details["next_episode_to_air"].get("air_date")
 
@@ -330,18 +432,20 @@ def sync_show_from_tmdb(conn: sqlitecloud.Connection, tmdb_id: int, api_key: str
 # Queries
 # ----------------------------
 def list_shows(conn: sqlitecloud.Connection) -> List[sqlitecloud.Row]:
+    user_id = st.session_state["user_id"]
     conn.row_factory = sqlitecloud.Row
-    cur = conn.execute(
-        """
-        SELECT s.*,
-               (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id) AS episode_total,
-               (SELECT COUNT(*) FROM episodes e JOIN watches w ON w.episode_id = e.id
-                 WHERE e.show_id = s.id) AS watched_count
-        FROM shows s
-        ORDER BY COALESCE(s.next_air_date, '9999-12-31') ASC, s.name ASC
-        """
-    )
-    return cur.fetchall()
+
+    q = """
+    SELECT s.*,
+           (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id) AS episode_total,
+           (SELECT COUNT(*) FROM episodes e JOIN watches w ON w.episode_id = e.id
+             WHERE e.show_id = s.id and w.user_id = ?) AS watched_count
+    FROM user_shows us
+    join shows s on s.id = us.show_id
+    where us.user_id = ?
+    ORDER BY COALESCE(s.next_air_date, '9999-12-31') ASC, s.name ASC
+    """
+    return conn.execute(q, cast(tuple[Any], (user_id, user_id))).fetchall()
 
 
 def show_episodes(conn: sqlitecloud.Connection, show_id: int, season: Optional[int] = None) -> List[sqlitecloud.Row]:
@@ -400,12 +504,27 @@ def next_unwatched(conn: sqlitecloud.Connection, show_id: int) -> Optional[sqlit
     return cur.fetchone()
 
 
-def log_watch(conn: sqlitecloud.Connection, episode_id: int, rating: Optional[int], notes: Optional[str]) -> None:
+def log_watch(conn, episode_id: int, rating: int = None, notes: str = None):
+    user_id = st.session_state["user_id"]
     conn.execute(
-        "INSERT INTO watches (episode_id, watched_at, rating, notes) VALUES (?, ?, ?, ?)",
-        cast(tuple[Any], (episode_id, datetime.datetime.now().isoformat(timespec="seconds"), rating, notes)),
+        "INSERT INTO watches (user_id, episode_id, watched_at, rating, notes) VALUES (?, ?, datetime('now'), ?, ?)",
+        (user_id, episode_id, rating, notes),
     )
     conn.commit()
+
+
+def get_watched_episodes(conn, show_id: int):
+    user_id = st.session_state["user_id"]
+    cur = conn.execute(
+        "SELECT e.episode_number, w.watched_at, w.rating, w.notes "
+        "FROM episodes e "
+        "JOIN seasons s ON e.season_number = s.id "
+        "JOIN shows sh ON s.show_id = sh.id "
+        "JOIN watches w ON e.id = w.episode_id "
+        "WHERE sh.id = ? AND w.user_id = ?",
+        (show_id, user_id)
+    )
+    return cur.fetchall()
 
 
 # ----------------------------
@@ -419,7 +538,8 @@ def get_alert_config(conn: sqlitecloud.Connection) -> sqlitecloud.Row:
 
 def save_alert_config(conn: sqlitecloud.Connection, email_to: str, sms_to: str, email_enabled: bool, sms_enabled: bool):
     conn.execute(
-        "UPDATE alert_config SET email_to=?, sms_to=?, email_enabled=?, sms_enabled=? WHERE id=1",
+        "UPDATE alert_config SET email_to=?, sms_to=?, carrier=?,"
+        " sms_via_email_enabled=?, email_enabled=?, sms_enabled=? WHERE id=1",
         cast(tuple[Any], (email_to or None, sms_to or None, 1 if email_enabled else 0, 1 if sms_enabled else 0)),
     )
     conn.commit()
@@ -453,7 +573,8 @@ def sms_via_email_address(phone: str, carrier: str) -> str | None:
 
 
 def send_alert(conn: sqlitecloud.Connection, subject: str, body: str) -> None:
-    cur = conn.execute("SELECT email_to, sms_to, email_enabled, sms_enabled, carrier, sms_via_email_enabled FROM alert_config WHERE id = 1")
+    cur = conn.execute("SELECT email_to, sms_to, email_enabled, "
+                       "sms_enabled, carrier, sms_via_email_enabled FROM alert_config WHERE id = 1")
     config = cur.fetchone()
     if not config:
         return
@@ -461,7 +582,7 @@ def send_alert(conn: sqlitecloud.Connection, subject: str, body: str) -> None:
     email_to, sms_to, email_enabled, sms_enabled, carrier, sms_via_email_enabled = config
 
     if email_enabled and email_to:
-        send_email(email_to, subject, body)
+        send_email(subject, body, email_to)
 
 #    if sms_enabled and sms_to:
 #        send_sms_direct(sms_to, body)  # placeholder for Twilio/etc.
@@ -469,7 +590,7 @@ def send_alert(conn: sqlitecloud.Connection, subject: str, body: str) -> None:
     if sms_via_email_enabled and sms_to and carrier:
         sms_email = sms_via_email_address(sms_to, carrier)
         if sms_email:
-            send_email(sms_email, subject, body)
+            send_email(subject, body, sms_email)
 
 
 def send_sms_via_email(phone_number: str, carrier: str, message: str):
@@ -484,14 +605,14 @@ def send_sms_via_email(phone_number: str, carrier: str, message: str):
 
     to_email = f"{phone_number}{gateways[carrier]}"
     msg = MIMEText(message)
-    msg["From"] = "your_email@example.com"
+    msg["From"] = SMTP_USER
     msg["To"] = to_email
-    msg["Subject"] = "Alert"
+    msg["Subject"] = "Binge Buddy Alert"
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
-        server.login("your_email@example.com", "your_app_password")
-        server.sendmail("your_email@example.com", to_email, msg.as_string())
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
 def format_alert(name: str, old_date: Optional[str], new_date: Optional[str]) -> str:
@@ -516,18 +637,21 @@ def check_and_alert_updates(conn: sqlitecloud.Connection, api_key: str) -> Dict[
     sms_carrier = cfg["sms_carrier"] or ALERT_SMS_CARRIER_DEFAULT
     do_email = bool(cfg["email_enabled"])
     do_sms = bool(cfg["sms_enabled"])
+    do_sms_email = bool(cfg["sms_via_email_enabled"])
 
     updated = 0
     emailed = 0
     texted = 0
+    sms_emailed = 0
 
     conn.row_factory = sqlitecloud.Row
     shows = conn.execute("SELECT * FROM shows").fetchall()
     for s in shows:
-        details = tmdb_tv_details(s["tmdb_id"], api_key)
-        new_date = None
-        if details.get("next_episode_to_air"):
-            new_date = details["next_episode_to_air"].get("air_date")
+        details = tmdb_tv_details(s["tmdb_id"], api_key) or {}
+        nxt = (details.get("next_episode_to_air") or {})
+        new_date = nxt.get("air_date")
+#    if details.get("next_episode_to_air"):
+        #    new_date = details["next_episode_to_air"].get("air_date")
 
         old_date = s["next_air_date"]
         if new_date != old_date:
@@ -554,6 +678,9 @@ def check_and_alert_updates(conn: sqlitecloud.Connection, api_key: str) -> Dict[
                 if do_sms and sms_to:
                     if send_sms_via_email(sms_to, sms_carrier, f"{s['name']}: next episode date updated -> {new_date}"):
                         texted += 1
+                if do_sms_email and sms_to:
+                    if send_sms_via_email(sms_to, sms_carrier, f"{s['name']}: next episode date updated -> {new_date}"):
+                        sms_emailed += 1
                 # record that we've alerted on this new date
                 conn.execute(
                     "UPDATE shows SET alerted_next_air_date=? WHERE id=?",
@@ -561,7 +688,7 @@ def check_and_alert_updates(conn: sqlitecloud.Connection, api_key: str) -> Dict[
                 )
                 conn.commit()
 
-    return {"updated": updated, "emailed": emailed, "texted": texted}
+    return {"updated": updated, "emailed": emailed, "texted": texted, "sms_emailed": sms_emailed}
 
 
 # ----------------------------
@@ -593,164 +720,209 @@ def render_show_card(row: sqlitecloud.Row):
 # ----------------------------
 # Pages
 # ----------------------------
-def page_add_show(conn: sqlitecloud.Connection, api_key: str):
-    st.subheader("Add / Import a Show")
+def page_profile(conn):
+    st.header("👤 My Profile")
 
-    # --- Search mode selection ---
-    mode = st.radio("Search mode", ["Simple", "Discover (filters)"], horizontal=True)
-
-    if mode == "Simple":
-        query = st.text_input("Search by title", placeholder="e.g., Countdown")
-        if st.button("Search", use_container_width=True) and query.strip():
-            results = tmdb_search_tv(query, api_key)
-            if not results:
-                st.info("No results.")
-            for r in results:
-                with st.container(border=True):
-                    title = r.get("name") or r.get("original_name")
-                    date = r.get("first_air_date") or "—"
-                    st.markdown(f"**{title}**  \nFirst aired: {date}")
-                    if r.get("poster_path"):
-                        st.image(poster_url(r["poster_path"]), width=160)
-                    st.caption(r.get("overview") or "")
-                    cols = st.columns([1, 1, 3])
-                    with cols[0]:
-                        if st.button(f"Import #{r['id']}", key=f"import_{r['id']}"):
-                            show_id = sync_show_from_tmdb(conn, r["id"], api_key)
-                            st.success(f"Imported '{title}' (show_id={show_id}).")
-                    with cols[1]:
-                        st.write(f"TMDB ID: {r['id']}")
-
-    else:
-        # --- Discover with filters ---
-        with st.expander("Filters", expanded=True):
-            genres_map = tmdb_tv_genres(api_key)
-            genre_names = list(genres_map.values())
-            sel_genres = st.multiselect("Genres", options=genre_names)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                year_from = st.number_input("First air year ≥", min_value=1950, max_value=2100, value=2000)
-            with col2:
-                year_to = st.number_input("First air year ≤", min_value=1950, max_value=2100,
-                                          value=datetime.date.today().year)
-            with col3:
-                min_vote = st.slider("Min TMDB rating", 0.0, 10.0, 6.5, 0.5)
-
-            language = st.text_input("Original language (ISO-639-1, e.g., en, ja, ko)", value="en")
-
-            colp = st.columns(3)
-            with colp[0]:
-                providers = st.text_input("Watch provider IDs (comma)",
-                                          help="""Advanced: TMDB provider IDs. Example: 8 for Netflix, 
-                                          9 for Prime (varies by region).""")
-            with colp[1]:
-                region = st.text_input("Watch region (ISO-3166-1, e.g., US)", value="US")
-            with colp[2]:
-                sort_by = st.selectbox("Sort by", ["popularity.desc", "first_air_date.desc",
-                                                   "vote_average.desc", "name.asc"])
-
-            statuses = st.multiselect("Status (post-filter)", ["Returning Series", "Ended", "Planned", "Canceled"])
-
-        if st.button("Discover", use_container_width=True):
-            params = {
-                "first_air_date.gte": f"{year_from}-01-01",
-                "first_air_date.lte": f"{year_to}-12-31",
-                "with_original_language": language,
-                "vote_average.gte": min_vote,
-                "sort_by": sort_by,
-                "page": 1,
-            }
-            if sel_genres:
-                # map names -> ids
-                ids = [gid for gid, name in genres_map.items() if name in sel_genres]
-                if ids:
-                    params["with_genres"] = ",".join(map(str, ids))
-            if providers.strip():
-                params["with_watch_providers"] = providers
-                params["watch_region"] = region
-
-            data = tmdb_discover_tv(api_key, params)
-            results = data.get("results", [])
-            if not results:
-                st.info("No results.")
-            for r in results:
-                # Post-filter by status if requested: need a details call to get status
-                if statuses:
-                    det = tmdb_tv_details(r["id"], api_key)
-                    if det.get("status") not in statuses:
-                        continue
-
-                with st.container(border=True):
-                    title = r.get("name") or r.get("original_name")
-                    date = r.get("first_air_date") or "—"
-                    st.markdown(f"**{title}**  \nFirst aired: {date}")
-                    if r.get("poster_path"):
-                        st.image(poster_url(r["poster_path"]), width=160)
-                    st.caption(r.get("overview") or "")
-                    cols = st.columns([1, 2])
-                    with cols[0]:
-                        if st.button(f"Import #{r['id']}", key=f"import_disc_{r['id']}"):
-                            show_id = sync_show_from_tmdb(conn, r["id"], api_key)
-                            st.success(f"Imported '{title}' (show_id={show_id}).")
-
-                    with cols[1]:
-                        det = tmdb_tv_details(r["id"], api_key)
-                        st.caption(f"Status: {det.get('status') or '—'}; "
-                                   f"Next air: {(det.get('next_episode_to_air') or {}).get('air_date') or '—'}")
-
-
-def page_watchlist(conn: sqlitecloud.Connection):
-    st.subheader("Watchlist")
-    rows = list_shows(conn)
-    if not rows:
-        st.info("No shows yet. Add one on the **Add Show** page.")
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        st.error("You must be logged in to view this page.")
         return
 
-    for row in rows:
-        with st.container(border=True):
-            render_show_card(row)
-            show_id = row["id"]
-            nx = next_unwatched(conn, show_id)
-            c1, c2, c3 = st.columns([1, 1, 2])
-            with c1:
-                if nx and st.button(f"Mark Next Up: S{nx['season_number']}E{nx['episode_number']} watched",
-                                    key=f"mark_{show_id}_{nx['id']}"):
-                    log_watch(conn, nx["id"], rating=None, notes=None)
-                    st.success("Marked watched.")
-                    st.rerun()
-            with c2:
-                if st.button("Open Episodes", key=f"open_{show_id}"):
-                    st.session_state["open_show"] = show_id
-                    st.rerun()
+    # Fetch current user info
+    cur = conn.execute(
+        "SELECT email, phone, carrier, enable_email, enable_sms FROM users WHERE id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
 
-            if st.session_state.get("open_show") == show_id:
-                st.markdown("---")
-                seasons = list_seasons(conn, show_id)
-                season_map = {f"S{r['season_number']} ({r['episode_count']} eps)": r["season_number"] for r in seasons}
-                sel = st.selectbox("Season", options=list(season_map.keys()))
-                season_num = season_map[sel]
-                eps = show_episodes(conn, show_id, season=season_num)
-                for ep in eps:
-                    with st.container(border=True):
-                        header = f"S{ep['season_number']}E{ep['episode_number']}: {ep['name'] or '—'}"
-                        st.markdown(f"**{header}**")
-                        meta = f"Air: {ep['air_date'] or '—'}"
-                        if ep["last_watched_at"]:
-                            meta += f" • Last watched: {ep['last_watched_at']}"
-                        st.caption(meta)
-                        if ep["overview"]:
-                            with st.expander("Episode overview"):
-                                st.write(ep["overview"])
+    if row:
+        current_email, current_phone, current_carrier, enable_email, enable_sms = row
+    else:
+        st.error("User not found.")
+        return
 
-                        with st.form(f"watch_{ep['id']}"):
-                            r = st.slider("Rating", 1, 5, value=ep["last_rating"] if ep["last_rating"] else 3)
-                            n = st.text_area("Notes", value=ep["last_notes"] or "", height=80)
-                            submitted = st.form_submit_button("Save watch")
-                            if submitted:
-                                log_watch(conn, ep["id"], rating=r, notes=n)
-                                st.success("Saved.")
-                                st.rerun()
+    # store session data
+
+    st.session_state.current_email = current_email
+    st.session_state.current_sms = current_phone
+    st.session_state.current_email_enabled = enable_email
+    st.session_state.current_sms_via_email_enabled = enable_sms
+    st.session_state.current_carrier = current_carrier
+
+
+def page_add_show(conn, api_key: str):
+    st.header("➕ Add Show")
+
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        st.error("You must be logged in to add shows.")
+        return
+
+    # Search input
+    query = st.text_input("Search for a TV Show")
+    if query:
+        results = tmdb_search_tv(query, api_key)
+
+        if not results:
+            st.warning("No results found.")
+        else:
+            for result in results:
+                show_id_tmdb = result["id"]
+                name = result["name"]
+                first_air_date = result.get("first_air_date", "Unknown")
+                overview = result.get("overview", "")
+
+                with st.expander(f"{name} ({first_air_date})"):
+                    st.write(overview)
+
+                    if st.button("Add to My Shows", key=f"add_{show_id_tmdb}"):
+                        # 1. Insert into global shows table
+                        cur = conn.execute("SELECT id FROM shows WHERE tmdb_id = ?", (show_id_tmdb,))
+                        row = cur.fetchone()
+
+                        if row:
+                            show_id = row[0]
+                        else:
+                            # Pull full details from TMDB
+                            details = tmdb_tv_details(show_id_tmdb, api_key) or {}
+                            status = details.get("status", "Unknown")
+                            next_air_date = (details.get("next_episode_to_air") or {}).get("air_date")
+
+                            conn.execute(
+                                "INSERT INTO shows (tmdb_id, name, status, next_air_date) VALUES (?, ?, ?, ?)",
+                                (show_id_tmdb, name, status, next_air_date),
+                            )
+                            conn.commit()
+
+                            show_id = conn.execute("SELECT id FROM shows WHERE tmdb_id = ?",
+                                                   (show_id_tmdb,)).fetchone()[0]
+
+                            # Load seasons/episodes into DB
+                            for season in details.get("seasons", []):
+                                season_num = season.get("season_number")
+                                episode_count = season.get("episode_count", 0)
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO seasons (show_id, season_number, episode_count) "
+                                    "VALUES (?, ?, ?)",
+                                    (show_id, season_num, episode_count),
+                                )
+                                conn.commit()
+
+                                season_id = conn.execute(
+                                    "SELECT id FROM seasons WHERE show_id=? AND season_number=?",
+                                    (show_id, season_num),
+                                ).fetchone()[0]
+
+                                season_details = tmdb_season_details(show_id_tmdb, season_num, api_key)
+                                for ep in season_details.get("episodes", []):
+                                    conn.execute(
+                                        "INSERT OR IGNORE INTO episodes (season_number, episode_number, name, air_date"
+                                        ", overview) VALUES (?, ?, ?, ?, ?)",
+                                        (
+                                            season_num,
+                                            ep["episode_number"],
+                                            ep["name"],
+                                            ep.get("air_date"),
+                                            ep.get("overview"),
+                                        ),
+                                    )
+                                conn.commit()
+
+                        # 2. Link show to this user
+                        conn.execute(
+                            "INSERT OR IGNORE INTO user_shows (user_id, show_id) VALUES (?, ?)",
+                            (user_id, show_id),
+                        )
+                        conn.commit()
+
+                        st.success(f"✅ {name} added to your watchlist!")
+                        st.rerun()
+
+
+def page_watchlist(conn):
+    st.header("📺 My Watchlist")
+
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        st.error("You must be logged in to view your watchlist.")
+        return
+
+    shows = get_user_shows(conn)
+    if not shows:
+        st.info("You haven't added any shows yet. Go to **Add Show** to start tracking.")
+        return
+
+    for show_id, name, status, next_air_date in shows:
+        with st.expander(f"{name} ({status})"):
+            st.write(f"**Next Air Date:** {next_air_date or 'N/A'}")
+
+            # Remove option
+            if st.button(f"❌ Remove from My Shows", key=f"remove_{show_id}"):
+                conn.execute("DELETE FROM user_shows WHERE user_id=? AND show_id=?", (user_id, show_id))
+                conn.commit()
+                st.success(f"Removed {name} from your watchlist.")
+                st.rerun()
+
+            # Seasons for this show
+            cur = conn.execute(
+                "SELECT id, season_number, episode_count FROM seasons WHERE show_id = ?",
+                (show_id,)
+            )
+            seasons = cur.fetchall()
+
+            for season_id, season_number, episode_count in seasons:
+                with st.expander(f"Season {season_number}"):
+                    cur = conn.execute(
+                        "SELECT id, episode_number, name, air_date FROM episodes WHERE season_number= ?",
+                        (season_id,)
+                    )
+                    episodes = cur.fetchall()
+
+                    # Watched episodes for this user
+                    watched = {
+                        row[0]: row for row in conn.execute(
+                            "SELECT e.id, w.watched_at, w.rating, w.notes "
+                            "FROM episodes e "
+                            "JOIN watches w ON e.id = w.episode_id "
+                            "WHERE e.season_number= ? AND w.user_id = ?",
+                            (season_id, user_id),
+                        ).fetchall()
+                    }
+
+                    for episode_id, ep_number, ep_name, air_date in episodes:
+                        watched_entry = watched.get(episode_id)
+                        col1, col2, col3 = st.columns([3, 2, 3])
+
+                        with col1:
+                            st.write(f"S{season_number}E{ep_number}: {ep_name}")
+                            st.caption(f"Air date: {air_date}")
+
+                        with col2:
+                            if watched_entry:
+                                st.success("Watched")
+                            else:
+                                if st.button("Mark Watched", key=f"watch_{episode_id}"):
+                                    log_watch(conn, episode_id)
+                                    st.rerun()
+
+                        with col3:
+                            if watched_entry:
+                                rating = watched_entry[2] or 0
+                                notes = watched_entry[3] or ""
+                                st.write(f"⭐ {rating if rating else 'N/A'}")
+                                if notes:
+                                    st.caption(f"Notes: {notes}")
+                                if st.button("Update Rating/Notes", key=f"edit_{episode_id}"):
+                                    with st.form(f"edit_form_{episode_id}"):
+                                        new_rating = st.slider("Rating", 1, 5, value=rating or 3)
+                                        new_notes = st.text_area("Notes", value=notes)
+                                        if st.form_submit_button("Save"):
+                                            conn.execute(
+                                                "UPDATE watches SET rating=?, notes=? WHERE user_id=? AND episode_id=?",
+                                                (new_rating, new_notes, user_id, episode_id),
+                                            )
+                                            conn.commit()
+                                            st.rerun()
 
 
 def page_next_up(conn: sqlitecloud.Connection):
@@ -775,32 +947,121 @@ def page_next_up(conn: sqlitecloud.Connection):
                 st.write("All caught up on logged episodes.")
 
 
-def page_alerts(conn: sqlitecloud.Connection, sql_api_key: str):
-    st.subheader("Alerts & Updates")
+def sync_show_updates(conn, user_id: int, api_key: str, t_api_key: str):
+    updated_count = 0
+    email_count = 0
+    sms_count = 0
 
-    cfg = get_alert_config(conn)
-    email_enabled = st.toggle("Enable email alerts", value=bool(cfg["email_enabled"]))
-    email_to = st.text_input("Send alerts to this email", value=cfg["email_to"] or ALERT_EMAIL_TO_DEFAULT)
+    # Get user info
+    cur = conn.execute(
+        "SELECT email, phone, carrier, enable_email, enable_sms FROM users WHERE id=?",
+        (user_id,)
+    )
+    user = cur.fetchone()
+    if not user:
+        return updated_count, email_count, sms_count
 
-    sms_enabled = st.toggle("Enable SMS alerts (Twilio)", value=bool(cfg["sms_enabled"]))
-    sms_to = st.text_input("Send alerts to this phone (E.164, e.g., +15551234567)",
-                           value=cfg["sms_to"] or ALERT_SMS_TO_DEFAULT)
+    user_email, user_phone, user_carrier, enable_email, enable_sms = user
 
-    if st.button("Save alert settings"):
-        save_alert_config(conn, email_to, sms_to, email_enabled, sms_enabled)
-        st.success("Saved alert preferences.")
+    # Get shows tracked by this user
+    cur = conn.execute(
+        "SELECT s.id, s.tmdb_id, s.name, s.next_air_date FROM shows s "
+        "JOIN user_shows us ON s.id = us.show_id "
+        "WHERE us.user_id = ?",
+        (user_id,)
+    )
+    tracked_shows = cur.fetchall()
+
+    for show_id, tmdb_id, name, old_air_date in tracked_shows:
+        try:
+            details = tmdb_tv_details(tmdb_id, api_key) or {}
+            status = details.get("status", "Unknown")
+            new_air_date = details.get("next_episode_to_air", {}).get("air_date")
+
+            # Only update if changed
+            if new_air_date and new_air_date != old_air_date:
+                conn.execute(
+                    "UPDATE shows SET next_air_date=? WHERE id=?",
+                    (new_air_date, show_id),
+                )
+                conn.commit()
+                updated_count += 1
+
+                # Send notifications
+                message = f"📺 Update for {name}: next episode now airs on {new_air_date}"
+
+                if enable_email and user_email:
+                    send_email("Show Update", message, user_email)
+                    email_count += 1
+
+                if enable_sms and user_phone and user_carrier:
+                    send_sms_via_email(user_phone, user_carrier, message)
+                    sms_count += 1
+
+        except Exception as e:
+            st.error(f"Error checking {name}: {e}")
+
+    return updated_count, email_count, sms_count
+
+
+def page_alerts(conn):
+    st.header("🔔 Alerts & Notifications")
+
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        st.error("You must be logged in to view this page.")
+        return
+
+    # Load current user settings
+    cur = conn.execute(
+        "SELECT email, phone, carrier, enable_email, enable_sms FROM users WHERE id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        st.error("User not found.")
+        return
+
+    current_email, current_phone, current_carrier, enable_email, enable_sms = row
+
+    # Form for updating alert preferences
+    with st.form("alerts_form"):
+        st.text_input("Alert Email", value=current_email or "", disabled=True)
+        st.text_input("Phone Number", value=current_phone or "", key="alerts_phone")
+        st.selectbox(
+            "Carrier",
+            ["", "AT&T", "Verizon", "T-Mobile", "Sprint"],
+            index=(["", "AT&T", "Verizon", "T-Mobile", "Sprint"].index(current_carrier)
+                   if current_carrier in ["AT&T", "Verizon", "T-Mobile", "Sprint"] else 0),
+            key="alerts_carrier",
+        )
+        enable_email_flag = st.checkbox("Enable Email Alerts", value=bool(enable_email))
+        enable_sms_flag = st.checkbox("Enable SMS via Email", value=bool(enable_sms))
+
+        submitted = st.form_submit_button("Save Alert Settings")
+
+    if submitted:
+        conn.execute(
+            "UPDATE users SET phone=?, carrier=?, enable_email=?, enable_sms=? WHERE id=?",
+            (
+                st.session_state["alerts_phone"],
+                st.session_state["alerts_carrier"],
+                int(enable_email_flag),
+                int(enable_sms_flag),
+                user_id,
+            ),
+        )
+        conn.commit()
+        st.success("Alert settings updated!")
 
     st.markdown("---")
-    st.caption("Manually check TMDB for updated 'next episode' dates and send alerts for changes.")
-    if st.button("Check now"):
-        if not DEFAULT_API_KEY and not st.session_state.get("api_key"):
-            st.warning("Enter your TMDB API key in the sidebar first.")
-        else:
-            api_used = st.session_state.get("api_key") or DEFAULT_API_KEY
-            result = check_and_alert_updates(conn, api_used)
-            st.success(f"Updated shows: {result['updated']} • "
-                       f"Emails sent: {result['emailed']} • "
-                       f"SMS sent: {result['texted']}")
+
+    # Manual sync with TMDB
+    st.subheader("Check for Show Updates")
+    if st.button("Check Now"):
+        updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"], sql_api_key)
+        st.info(f"Updated shows: {updated_count} • Emails sent: {email_count} • SMS sent: {sms_count}")
 
 
 # ----------------------------
@@ -811,45 +1072,82 @@ def main():
     st.title("📺 Personal Show Tracker")
 
     with st.sidebar:
-        st.markdown("### Settings")
-        api_key = st.text_input("TMDB API Key", value=DEFAULT_API_KEY, type="password")
-        st.session_state["api_key"] = api_key
-        if not api_key:
-            st.warning("Enter your TMDB API key to search/import.")
+        if DEBUG_ON:
+            st.markdown("### Settings")
+            api_key = st.text_input("TMDB API Key", value=DEFAULT_API_KEY, type="password")
+            st.session_state["api_key"] = api_key
+            if not api_key:
+                st.warning("Enter your TMDB API key to search/import.")
 
         conn = get_conn()
         init_db(conn)
         st.info("SQLite DB ready.")
+        if "user_id" not in st.session_state:
+            login_screen(conn)
+            return
 
         st.markdown("---")
         st.caption("Powered by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.")
 
     tabs = st.tabs(["Add Show", "Watchlist", "Next Up", "Alerts", "Profile"])
     with tabs[0]:
-        page_add_show(conn, api_key)
+        page_add_show(conn, DEFAULT_API_KEY)
     with tabs[1]:
         page_watchlist(conn)
     with tabs[2]:
         page_next_up(conn)
     with tabs[3]:
-        page_alerts(conn, api_key)
+        page_alerts(conn)
     with tabs[4]:
-        with st.form("alerts"):
-            email_to = st.text_input("Alert Email", value=current_email)
-            sms_to = st.text_input("Phone Number", value=current_sms)
-            carrier = st.selectbox("Carrier", ["", "AT&T", "Verizon", "TMobile", "Sprint"], index=0)
-            email_enabled = st.checkbox("Enable Email Alerts", value=bool(current_email_enabled))
-            sms_via_email_enabled = st.checkbox("Enable SMS via Email",
-                                                value=bool(current_sms_via_email_enabled))
+        # elif page == "Profile":
+        page_profile(conn)
 
-            if st.form_submit_button("Save"):
-                conn.execute("""
-                    UPDATE alert_config
-                    SET email_to=?, sms_to=?, carrier=?, email_enabled=?, sms_via_email_enabled=?
-                    WHERE id=1
-                """, cast(tuple[Any], (email_to, sms_to, carrier, int(email_enabled), int(sms_via_email_enabled))))
-                conn.commit()
-                st.success("Alert preferences updated")
+        user_id = st.session_state.user_id
+        current_email = st.session_state.current_email
+        current_phone = st.session_state.current_sms
+        current_carrier = st.session_state.current_carrier
+        enable_email = st.session_state.current_email_enabled
+        enable_sms = st.session_state.current_sms_via_email_enabled
+
+        # Profile form
+        with st.form("profile_form"):
+            st.text_input("Email (cannot change here)", value=current_email, disabled=True)
+            phone = st.text_input("Phone", value=current_phone or "")
+            carrier = st.selectbox(
+                "Carrier",
+                ["", "AT&T", "Verizon", "T-Mobile", "Sprint"],
+                index=(["", "AT&T", "Verizon", "T-Mobile", "Sprint"].index(current_carrier)
+                       if current_carrier in ["AT&T", "Verizon", "T-Mobile", "Sprint"] else 0)
+            )
+            enable_email_flag = st.checkbox("Enable Email Alerts", value=bool(enable_email))
+            enable_sms_flag = st.checkbox("Enable SMS Alerts", value=bool(enable_sms))
+
+            st.markdown("---")
+            new_password = st.text_input("Change Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+
+            submitted = st.form_submit_button("Save Changes")
+
+        if submitted:
+            # Update profile
+            conn.execute(
+                "UPDATE users SET phone=?, carrier=?, enable_email=?, enable_sms=? WHERE id=?",
+                cast(tuple[Any], (phone, carrier, int(enable_email_flag), int(enable_sms_flag), user_id)),
+            )
+
+            # Update password if provided
+            if new_password:
+                if new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    conn.execute(
+                        "UPDATE users SET password_hash=? WHERE id=?",
+                        (hash_password(new_password), user_id),
+                    )
+                    st.success("Password updated!")
+
+            conn.commit()
+            st.success("Profile updated successfully.")
 
 
 if __name__ == "__main__":
