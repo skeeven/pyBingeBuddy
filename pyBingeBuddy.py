@@ -8,6 +8,7 @@ from email.mime.text import MIMEText
 from typing import Optional, List, Dict, Any, cast
 import bcrypt
 import streamlit as st
+from urllib.parse import urlparse, urlunparse
 
 # Optional SMS
 # try:
@@ -143,15 +144,36 @@ def login_screen(conn):
 # ----------------------------
 # DB Utilities
 # ----------------------------
+#def get_conn() -> sqlitecloud.Connection:
+#    if not sc_url or not sc_dbname:
+#        st.error("Missing SQLITE_CLOUD_URL or SQLITE_DB. Set them in .env or secrets.toml.")
+#        raise RuntimeError("Database configuration missing")
+#    conn = sqlitecloud.connect(sc_url)
+#    # Always quote DB names (handles hyphens/spaces/mixed case)
+#    safe = sc_dbname.replace('"', '""')
+#    conn.execute(f'USE DATABASE "{safe}"')
+#    return conn
+
+
 def get_conn() -> sqlitecloud.Connection:
-    if not sc_url or not sc_dbname:
-        st.error("Missing SQLITE_CLOUD_URL or SQLITE_DB. Set them in .env or secrets.toml.")
-        raise RuntimeError("Database configuration missing")
+    # tolerant secret getter
+    def _sec(k: str, d: str = "") -> str:
+        try: return (os.getenv(k) or st.secrets.get(k, d) or "").strip()
+        except Exception: return d
+
+    sc_url = _sec("SQLITE_CLOUD_URL")
+    if not sc_url.startswith("sqlitecloud://"):
+        st.error("SQLITE_CLOUD_URL missing/invalid"); raise RuntimeError
+
+    # Ensure DB is in URL path; if user also kept SQLITE_DB, reconcile it
+    sc_dbname = _sec("SQLITE_DB")  # ok if empty
+    u = urlparse(sc_url)
+    if sc_dbname and (u.path.lstrip("/") != sc_dbname):
+        u = u._replace(path="/" + sc_dbname)  # inject DB into URL path
+        sc_url = urlunparse(u)
+
     conn = sqlitecloud.connect(sc_url)
-    # Always quote DB names (handles hyphens/spaces/mixed case)
-    safe = sc_dbname.replace('"', '""')
-    conn.execute(f'USE DATABASE "{safe}"')
-    return conn
+    return conn  # <-- no USE DATABASE
 
 
 def init_db(conn: sqlitecloud.Connection) -> None:
