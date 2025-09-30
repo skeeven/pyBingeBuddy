@@ -148,12 +148,15 @@ def get_conn() -> sqlitecloud.Connection:
         st.error("Missing SQLITE_CLOUD_URL or SQLITE_DB. Set them in .env or secrets.toml.")
         raise RuntimeError("Database configuration missing")
     conn = sqlitecloud.connect(sc_url)
-    conn.execute(f"USE DATABASE {sc_dbname}")
+    # Always quote DB names (handles hyphens/spaces/mixed case)
+    safe = sc_dbname.replace('"', '""')
+    conn.execute(f'USE DATABASE "{safe}"')
     return conn
 
 
 def init_db(conn: sqlitecloud.Connection) -> None:
     schema = """
+    
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
