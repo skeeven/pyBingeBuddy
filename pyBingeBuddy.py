@@ -20,7 +20,7 @@ from urllib.parse import urlparse, urlunparse
 # Config
 # ----------------------------
 APP_DB = "shows.db"
-DEBUG_ON = False # True
+DEBUG_ON = False  # True
 TMDB_BASE = "https://api.themoviedb.org/3"
 
 # Try .env (local dev) then Streamlit secrets
@@ -144,7 +144,7 @@ def login_screen(conn):
 # ----------------------------
 # DB Utilities
 # ----------------------------
-#def get_conn() -> sqlitecloud.Connection:
+# def get_conn() -> sqlitecloud.Connection:
 #    if not sc_url or not sc_dbname:
 #        st.error("Missing SQLITE_CLOUD_URL or SQLITE_DB. Set them in .env or secrets.toml.")
 #        raise RuntimeError("Database configuration missing")
@@ -158,8 +158,10 @@ def login_screen(conn):
 def get_conn() -> sqlitecloud.Connection:
     # tolerant secret getter
     def _sec(k: str, d: str = "") -> str:
-        try: return (os.getenv(k) or st.secrets.get(k, d) or "").strip()
-        except Exception: return d
+        try:
+            return (os.getenv(k) or st.secrets.get(k, d) or "").strip()
+        except Exception:
+            return d
 
     sc_url = _sec("SQLITE_CLOUD_URL")
     if not sc_url.startswith("sqlitecloud://"):
@@ -999,7 +1001,7 @@ def sync_show_updates(conn, user_id: int, api_key: str, t_api_key: str):
 
     for show_id, tmdb_id, name, old_air_date in tracked_shows:
         try:
-            details = tmdb_tv_details(tmdb_id, api_key) or {}
+            details = tmdb_tv_details(tmdb_id, t_api_key) or {}
             status = details.get("status", "Unknown")
             new_air_date = details.get("next_episode_to_air", {}).get("air_date")
 
@@ -1085,7 +1087,7 @@ def page_alerts(conn):
     # Manual sync with TMDB
     st.subheader("Check for Show Updates")
     if st.button("Check Now"):
-        updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"], sql_api_key)
+        updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"], sql_api_key, DEFAULT_API_KEY)
         st.info(f"Updated shows: {updated_count} • Emails sent: {email_count} • SMS sent: {sms_count}")
 
 
@@ -1095,6 +1097,7 @@ def page_alerts(conn):
 def main():
     st.set_page_config(page_title="Show Tracker", layout="wide")
     st.title("📺 Personal Show Tracker")
+    st.write("Environment: ", ENVIRON)
 
     with st.sidebar:
         if DEBUG_ON:
