@@ -177,7 +177,7 @@ st.markdown(("✅ " if sqlite_ok else "❌ ") + sqlite_msg)
 
 try:
     conn = sqlitecloud.connect(sqlite_url)
-    init_db(conn)
+    # init_db(conn)
     conn.execute("SELECT 1;")  # sanity probe
     st.success("Connected to SQLite Cloud.")
 except Exception as e:
