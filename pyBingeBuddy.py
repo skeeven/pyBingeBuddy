@@ -49,9 +49,8 @@ def validate_sqlite_url(url: str) -> tuple[bool, str]:
     return True, f"Host={host}, DB={db}, Key={mask(key)}"
 
 
-def init_db(conn) -> None:
+def init_db(conn2) -> None:
     schema = """
-
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
@@ -143,8 +142,8 @@ def init_db(conn) -> None:
     for stmt in schema.split(";"):
         stmt = stmt.strip()
         if stmt:  # skip empty lines
-            conn.execute(stmt)
-    conn.commit()
+            conn2.execute(stmt)
+            conn2.commit()
 
 
 # 1) Show raw keys loaded from st.secrets (masked when sensitive)
