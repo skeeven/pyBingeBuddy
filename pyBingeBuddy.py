@@ -49,7 +49,7 @@ def validate_sqlite_url(url: str) -> tuple[bool, str]:
     return True, f"Host={host}, DB={db}, Key={mask(key)}"
 
 
-def init_db() -> None:
+def init_db(conn) -> None:
     schema = """
 
         CREATE TABLE IF NOT EXISTS users (
@@ -138,13 +138,13 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_watches_episode ON watches(episode_id);
         """
 
-    conn2 = sqlitecloud.connect(sqlite_url)
+    # conn2 = sqlitecloud.connect(sqlite_url)
     # Run statements one by one
     for stmt in schema.split(";"):
         stmt = stmt.strip()
         if stmt:  # skip empty lines
-            conn2.execute(stmt)
-    conn2.commit()
+            conn.execute(stmt)
+    conn.commit()
 
 
 # 1) Show raw keys loaded from st.secrets (masked when sensitive)
@@ -178,7 +178,7 @@ st.markdown(("✅ " if sqlite_ok else "❌ ") + sqlite_msg)
 
 try:
     conn = sqlitecloud.connect(sqlite_url)
-    init_db()
+    init_db(conn)
     conn.execute("SELECT 1;")  # sanity probe
     st.success("Connected to SQLite Cloud.")
 except Exception as e:
