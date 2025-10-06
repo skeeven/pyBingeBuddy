@@ -181,103 +181,6 @@ def get_validated_conn(url: str) -> sqlitecloud.Connection | None:
         return None
 
 
-def init_db(conn: sqlitecloud.Connection) -> None:
-    schema = """
-
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            phone TEXT,
-            carrier TEXT,
-            enable_email INTEGER,
-            enable_sms INTEGER,
-            password_hash TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS shows (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            tmdb_id         INTEGER UNIQUE NOT NULL,
-            name            TEXT NOT NULL,
-            status          TEXT,
-            next_air_date   TEXT,
-            overview        TEXT,
-            poster_path     TEXT,
-            first_air_date  TEXT,
-            last_air_date   TEXT,
-            -- new: what date we already alerted on (to avoid duplicates)
-            alerted_next_air_date TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS seasons (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            show_id         INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-            season_number   INTEGER NOT NULL,
-            name            TEXT,
-            air_date        TEXT,
-            episode_count   INTEGER,
-            UNIQUE(show_id, season_number)
-        );
-
-        CREATE TABLE IF NOT EXISTS episodes (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            show_id         INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-            season_number   INTEGER NOT NULL,
-            episode_number  INTEGER NOT NULL,
-            tmdb_episode_id INTEGER UNIQUE,
-            name            TEXT,
-            air_date        TEXT,
-            overview        TEXT,
-            runtime         INTEGER,
-            UNIQUE(show_id, season_number, episode_number)
-        );
-
-        CREATE TABLE IF NOT EXISTS user_shows (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER,
-            show_id INTEGER,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(show_id) REFERENCES shows(id),
-            UNIQUE(user_id, show_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS watches (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            episode_id      INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-            watched_at      TEXT NOT NULL,
-            rating          INTEGER,
-            notes           TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(episode_id) REFERENCES episodes(id)
-        );
-
-        -- Persist alert recipients & preferences
-        CREATE TABLE IF NOT EXISTS alert_config (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            email_to TEXT,
-            sms_to TEXT,
-            carrier TEXT, -- NEW: carrier for email-to-sms
-            sms_via_email_enabled INTEGER DEFAULT 0, -- NEW: opt-in
-            email_enabled INTEGER DEFAULT 0,
-            sms_enabled INTEGER DEFAULT 0
-        );
-
-        INSERT OR IGNORE INTO alert_config (id, email_to, sms_to, carrier, sms_via_email_enabled,
-        email_enabled, sms_enabled)
-        VALUES (1, NULL, NULL, NULL, 0, 0, 0);
-
-        CREATE INDEX IF NOT EXISTS idx_episodes_show ON episodes(show_id);
-        CREATE INDEX IF NOT EXISTS idx_watches_episode ON watches(episode_id);
-        """
-
-    # Run statements one by one
-    for stmt in schema.split(";"):
-        stmt = stmt.strip()
-        if stmt:  # skip empty lines
-            conn.execute(stmt)
-    conn.commit()
-
-
 # ----------------------------
 # TMDB API
 # ----------------------------
@@ -409,6 +312,48 @@ def upsert_season(conn: sqlitecloud.Connection, show_id: int, season_obj: Dict[s
         cast(tuple[Any], (show_id, season_obj.get("season_number")))
              )
     return cur.fetchone()[0]
+
+
+def upsert_episodes_from_tmdb(
+    conn: sqlitecloud.Connection,
+    tmdb_show_id: int,
+    show_id: int,
+    season_number: int,
+    api_key: str,
+) -> None:
+    # Get full season details from TMDB
+    sdetails = tmdb_season_details(tmdb_show_id, season_number, api_key) or {}
+
+    episodes = sdetails.get("episodes") or []
+    if not episodes:
+        return  # nothing to insert
+
+    upsert_sql = """
+    INSERT INTO episodes (show_id, season_number, episode_number, name, air_date, overview)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(show_id, season_number, episode_number) DO UPDATE SET
+      name=excluded.name,
+      air_date=excluded.air_date,
+      overview=excluded.overview
+    """
+    for ep in episodes:
+        conn.execute(
+            upsert_sql,
+            (
+                show_id,
+                season_number,
+                ep.get("episode_number"),
+                ep.get("name"),
+                ep.get("air_date"),
+                ep.get("overview"),
+            ),
+        )
+    conn.commit()
+
+
+def safe_next_air_date(details: dict):
+    nxt = details.get("next_episode_to_air")
+    return nxt.get("air_date") if isinstance(nxt, dict) else None
 
 
 def upsert_episode(conn: sqlitecloud.Connection, show_id: int, ep: Dict[str, Any]) -> int:
@@ -1116,7 +1061,7 @@ def main():
         if "user_id" not in st.session_state:
             login_screen(conn)
             return
-
+        # st.write(f"Welcome, {st.session_state['current_email']}!")
         st.markdown("---")
         st.caption("Powered by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.")
 
