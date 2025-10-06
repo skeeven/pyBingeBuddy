@@ -1061,7 +1061,8 @@ def main():
         if "user_id" not in st.session_state:
             login_screen(conn)
             return
-        # st.write(f"Welcome, {st.session_state['current_email']}!")
+        st.write(f"Welcome, {st.session_state['user_email']}!")
+
         st.markdown("---")
         st.caption("Powered by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.")
 
