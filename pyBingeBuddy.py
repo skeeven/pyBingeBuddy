@@ -142,6 +142,21 @@ def login_screen(conn):
                 st.error(f"Error creating account: {e}")
 
 
+def logout():
+    """Close DB connection (if any), clear session, and return to login."""
+    conn = st.session_state.pop("conn", None)
+    try:
+        if conn and hasattr(conn, "close"):
+            conn.close()
+    except Exception:
+        # Keep the UI clean; optionally log
+        pass
+
+    # Clear everything; if you want to keep some keys (e.g. api_key), remove them from this loop
+    st.session_state.clear()
+    st.rerun()
+
+
 def mask(key: str) -> str:
     return key[:4] + "..." + key[-4:]
 
@@ -912,6 +927,17 @@ def page_next_up(conn: sqlitecloud.Connection):
         with st.container(border=True):
             st.markdown(f"### {row['name']}")
             st.write(f"**Next Air Date:** {row['next_air_date'] or '—'}  •  **Status:** {row['status'] or '—'}")
+            providers = tmdb_watch_providers(row["id"], DEFAULT_API_KEY)
+            if providers:
+                st.write("Available on:")
+                cols = st.columns(len(providers))
+                for col, p in zip(cols, providers):
+                    if p["logo"]:
+                        col.image(p["logo"], width=60)
+                    col.caption(p["name"])
+            else:
+                st.info("No streaming info available for this region.")
+
             if nx:
                 st.write(f"**Next Up:** S{nx['season_number']}E{nx['episode_number']} — {nx['name'] or '—'}")
                 if st.button(f"Mark watched: S{nx['season_number']}E{nx['episode_number']}", key=f"nx_{nx['id']}"):
@@ -977,6 +1003,26 @@ def sync_show_updates(conn, user_id: int, api_key: str, t_api_key: str):
             st.error(f"Error checking {name}: {e}")
 
     return updated_count, email_count, sms_count
+
+
+# https://api.themoviedb.org/3/tv/82856/watch/providers?api_key=56fd720902db9675d91e844b44f58351
+def tmdb_watch_providers(tmdb_id: int, api_key: str, region: str = "US") -> list[dict]:
+    """Return streaming providers (flatrate) for a given show and region."""
+    import requests
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/watch/providers"
+    r = requests.get(url, params={"api_key": api_key})
+    if r.status_code != 200:
+        return []
+    data = r.json().get("results", {})
+    country = data.get(region, {})
+    providers = country.get("flatrate", []) or []
+    return [
+        {
+            "name": p.get("provider_name"),
+            "logo": f"https://image.tmdb.org/t/p/w92{p['logo_path']}" if p.get("logo_path") else None,
+        }
+        for p in providers
+    ]
 
 
 def page_alerts(conn):
@@ -1057,11 +1103,19 @@ def main():
 
         conn = get_validated_conn(sc_url)
         # init_db(conn)
+        st.session_state["conn"] = conn  # <-- store it for logout()
         st.info("SQLite DB ready.")
-        if "user_id" not in st.session_state:
-            login_screen(conn)
-            return
-        st.write(f"Welcome, {st.session_state['user_email']}!")
+        # If not logged in, show the login screen and stop rendering the rest
+        if not st.session_state.get("user_id"):
+            login_screen(st.session_state["conn"])
+            st.stop()
+
+        # If logged in, surface a compact identity + logout
+        if st.session_state.get("user_id"):
+            st.caption(f"Signed in as: {st.session_state.get('user_email', 'Unknown')}")
+            # IMPORTANT: inline button (NO on_click), so st.rerun() in logout() is not in a callback
+            if st.button("🚪 Logout", use_container_width=True):
+                logout()
 
         st.markdown("---")
         st.caption("Powered by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.")
