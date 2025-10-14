@@ -266,8 +266,8 @@ def tmdb_season_details(tmdb_id: int, season_number: int, api_key: str) -> Dict[
 # Sync: TMDB -> SQLite
 # ----------------------------
 def upsert_show(conn: sqlitecloud.Connection, details: Dict[str, Any]) -> int:
-    next_air_date = {}
-    if details.get("next_episode_to_air"):
+    next_air_date = None
+    if isinstance(details.get("next_episode_to_air"), dict):
         next_air_date = details["next_episode_to_air"].get("air_date")
 
     # 👇 Explicitly tell the type checker this is a generic tuple of Any
@@ -315,9 +315,9 @@ def upsert_season(conn: sqlitecloud.Connection, show_id: int, season_obj: Dict[s
     useason_params: tuple[Any, ...] = (
         show_id,
         season_obj.get("season_number"),
-        season_obj.get("name"),
+        season_obj.get("name") or f"Season {season_obj.get('season_number', '?')}",
         season_obj.get("air_date"),
-        season_obj.get("episode_count"),
+        season_obj.get("episode_count", 0),
     )
 
     conn.execute(useason_sql, cast(tuple[Any], useason_params))
@@ -402,20 +402,49 @@ def upsert_episode(conn: sqlitecloud.Connection, show_id: int, ep: Dict[str, Any
 
 
 def sync_show_from_tmdb(conn: sqlitecloud.Connection, tmdb_id: int, api_key: str) -> int:
-    details = tmdb_tv_details(tmdb_id, api_key)
-    show_id = upsert_show(conn, details)
+    """Sync a show from TMDB, including all seasons and episodes."""
+    try:
+        details = tmdb_tv_details(tmdb_id, api_key)
+        if not details or not details.get("id"):
+            raise ValueError(f"Could not fetch details for TMDB ID {tmdb_id}")
 
-    for s in details.get("seasons", []):
-        season_num = s.get("season_number")
-        if season_num is None:
-            continue
-        season_full = tmdb_season_details(tmdb_id, season_num, api_key)
-        upsert_season(conn, show_id, season_full)
-        for ep in season_full.get("episodes", []):
-            ep_copy = dict(ep)
-            ep_copy["season_number"] = season_num
-            upsert_episode(conn, show_id, ep_copy)
-    return show_id
+        show_id = upsert_show(conn, details)
+
+        seasons = details.get("seasons", [])
+        if not seasons:
+            st.warning(f"No seasons found for this show (TMDB ID: {tmdb_id})")
+            return show_id
+
+        for s in seasons:
+            season_num = s.get("season_number")
+            if season_num is None:
+                continue
+
+            try:
+                # Get full season details from TMDB
+                season_full = tmdb_season_details(tmdb_id, season_num, api_key)
+                if not season_full:
+                    st.warning(f"Could not fetch details for Season {season_num}")
+                    continue
+
+                upsert_season(conn, show_id, season_full)
+
+                # Insert episodes
+                episodes = season_full.get("episodes", [])
+                for ep in episodes:
+                    ep_copy = dict(ep)
+                    ep_copy["season_number"] = season_num
+                    upsert_episode(conn, show_id, ep_copy)
+
+            except Exception as e:
+                st.warning(f"Error syncing Season {season_num}: {e}")
+                continue
+
+        return show_id
+
+    except Exception as e:
+        st.error(f"Error syncing show (TMDB ID {tmdb_id}): {e}")
+        raise
 
 
 # ----------------------------
@@ -806,11 +835,13 @@ def page_add_show(conn, api_key: str):
                                 season_details = tmdb_season_details(show_id_tmdb, season_num, api_key)
                                 for ep in season_details.get("episodes", []):
                                     conn.execute(
-                                        "INSERT OR IGNORE INTO episodes (season_number, episode_number, name, air_date"
-                                        ", overview) VALUES (?, ?, ?, ?, ?)",
+                                        "INSERT OR IGNORE INTO episodes (show_id, season_number, episode_number"
+                                        ", tmdb_episode_id, name, air_date, overview) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                         (
+                                            show_id,
                                             season_num,
                                             ep["episode_number"],
+                                            ep["id"],
                                             ep["name"],
                                             ep.get("air_date"),
                                             ep.get("overview"),
@@ -824,6 +855,9 @@ def page_add_show(conn, api_key: str):
                             (user_id, show_id),
                         )
                         conn.commit()
+
+                        # <-- Add this: populate seasons + episodes now
+                        # sync_show_from_tmdb(conn, show_id_tmdb, api_key)
 
                         st.success(f"✅ {name} added to your watchlist!")
                         st.rerun()
@@ -846,13 +880,31 @@ def page_watchlist(conn):
         with st.expander(f"{name} ({status})"):
             st.write(f"**Next Air Date:** {next_air_date or 'N/A'}")
 
+            col1, col2 = st.columns(2)  # small button column + rest of header
             # Remove option
-            if st.button(f"❌ Remove from My Shows", key=f"remove_{show_id}"):
-                conn.execute("DELETE FROM user_shows WHERE user_id=? AND show_id=?", (user_id, show_id))
-                conn.commit()
-                st.success(f"Removed {name} from your watchlist.")
-                st.rerun()
+            with col1:
+                if st.button(f"❌ Remove from My Shows", key=f"remove_{show_id}"):
+                    conn.execute("DELETE FROM user_shows WHERE user_id=? AND show_id=?", (user_id, show_id))
+                    conn.commit()
+                    st.success(f"Removed {name} from your watchlist.")
+                    st.rerun()
+            # === PLACE THE RESYNC BUTTON RIGHT HERE (per-show) ===
+            tmdb_id_row = conn.execute(
+                "SELECT tmdb_id FROM shows WHERE id = ?",
+                (show_id,)
+            ).fetchone()
+            tmdb_id = tmdb_id_row[0] if tmdb_id_row else None
 
+            with col2:
+                if tmdb_id and st.button("🔁 Resync from TMDB", key=f"resync_{show_id}"):
+                    # Inline call (not a callback) so st.rerun() works
+                    sync_show_from_tmdb(
+                        conn,
+                        tmdb_id,
+                        st.session_state.get("api_key") or DEFAULT_API_KEY
+                    )
+                    st.success("Resynced seasons & episodes. Refreshing…")
+                    st.rerun()
             # Seasons for this show
             cur = conn.execute(
                 "SELECT id, season_number, episode_count FROM seasons WHERE show_id = ?",
@@ -863,9 +915,10 @@ def page_watchlist(conn):
             for season_id, season_number, episode_count in seasons:
                 with st.expander(f"Season {season_number}"):
                     cur = conn.execute(
-                        "SELECT id, episode_number, name, air_date FROM episodes WHERE season_number= ?",
-                        (season_id,)
+                        "SELECT id, episode_number, name, air_date FROM episodes WHERE show_id=? AND season_number=?",
+                        (show_id, season_number)
                     )
+
                     episodes = cur.fetchall()
 
                     # Watched episodes for this user
@@ -874,8 +927,8 @@ def page_watchlist(conn):
                             "SELECT e.id, w.watched_at, w.rating, w.notes "
                             "FROM episodes e "
                             "JOIN watches w ON e.id = w.episode_id "
-                            "WHERE e.season_number= ? AND w.user_id = ?",
-                            (season_id, user_id),
+                            "WHERE e.season_number= ? AND w.user_id = ? and e.show_id = ?",
+                            (season_id, user_id, show_id),
                         ).fetchall()
                     }
 
@@ -927,7 +980,7 @@ def page_next_up(conn: sqlitecloud.Connection):
         with st.container(border=True):
             st.markdown(f"### {row['name']}")
             st.write(f"**Next Air Date:** {row['next_air_date'] or '—'}  •  **Status:** {row['status'] or '—'}")
-            providers = tmdb_watch_providers(row["id"], DEFAULT_API_KEY)
+            providers = tmdb_watch_providers(row["tmdb_id"], DEFAULT_API_KEY)
             if providers:
                 st.write("Available on:")
                 cols = st.columns(len(providers))
@@ -1114,6 +1167,41 @@ def main():
         if st.session_state.get("user_id"):
             st.caption(f"Signed in as: {st.session_state.get('user_email', 'Unknown')}")
             # IMPORTANT: inline button (NO on_click), so st.rerun() in logout() is not in a callback
+            # if st.button("Sync Databases", use_container_width=True):
+            #    sync_show_from_tmdb(st.session_state.get("conn"), st.session_state.get(""), st.session_state.get("api_key") )
+                # conn: sqlitecloud.Connection, tmdb_id: int, api_key
+            if st.button("🔄 Sync All Shows", use_container_width=True):
+                conn = st.session_state.get("conn")
+                api_key = st.session_state.get("api_key") or DEFAULT_API_KEY
+
+                # Get all shows for this user
+                cur = conn.execute(
+                    "SELECT s.id, s.tmdb_id, s.name FROM shows s "
+                    "JOIN user_shows us ON s.id = us.show_id "
+                    "WHERE us.user_id = ?",
+                    (st.session_state["user_id"],)
+                )
+                shows = cur.fetchall()
+
+                if shows:
+                    progress = st.progress(0)
+                    synced = 0
+                    failed = 0
+
+                    for idx, (show_id, tmdb_id, name) in enumerate(shows):
+                        try:
+                            sync_show_from_tmdb(conn, tmdb_id, api_key)
+                            synced += 1
+                        except Exception as e:
+                            st.error(f"❌ Error syncing {name}: {e}")
+                            failed += 1
+                        finally:
+                            progress.progress((idx + 1) / len(shows))
+
+                    st.success(f"✅ Synced {synced} shows! {failed} failed.")
+                    st.rerun()
+                else:
+                    st.info("No shows to sync.")
             if st.button("🚪 Logout", use_container_width=True):
                 logout()
 
