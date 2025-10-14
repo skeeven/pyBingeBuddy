@@ -304,6 +304,12 @@ def upsert_show(conn: sqlitecloud.Connection, details: Dict[str, Any]) -> int:
 
 
 def upsert_season(conn: sqlitecloud.Connection, show_id: int, season_obj: Dict[str, Any]) -> int:
+    """Insert or update a season. season_obj should be the FULL season details from TMDB."""
+    # Count actual episodes if available
+    episodes = season_obj.get("episodes", [])
+    episode_count = len(episodes) if episodes else season_obj.get("episode_count", 0)
+
+
     useason_sql = """
     INSERT INTO seasons (show_id, season_number, name, air_date, episode_count)
     VALUES (?, ?, ?, ?, ?)
@@ -317,7 +323,7 @@ def upsert_season(conn: sqlitecloud.Connection, show_id: int, season_obj: Dict[s
         season_obj.get("season_number"),
         season_obj.get("name") or f"Season {season_obj.get('season_number', '?')}",
         season_obj.get("air_date"),
-        season_obj.get("episode_count", 0),
+        episode_count,
     )
 
     conn.execute(useason_sql, cast(tuple[Any], useason_params))
@@ -524,7 +530,21 @@ def next_unwatched(conn: sqlitecloud.Connection, show_id: int) -> Optional[sqlit
 
 
 def log_watch(conn, episode_id: int, rating: int = None, notes: str = None):
-    user_id = st.session_state["user_id"]
+    """Log a watch event for an episode."""
+    user_id = st.session_state.get("user_id")
+
+    if not user_id:
+        raise ValueError("No user_id in session")
+
+    if not episode_id:
+        raise ValueError("Invalid episode_id")
+
+    # Verify episode exists
+    check = conn.execute("SELECT id FROM episodes WHERE id = ?", (episode_id,)).fetchone()
+    if not check:
+        raise ValueError(f"Episode {episode_id} not found in database")
+
+    # Insert watch record
     conn.execute(
         "INSERT INTO watches (user_id, episode_id, watched_at, rating, notes) VALUES (?, ?, datetime('now'), ?, ?)",
         (user_id, episode_id, rating, notes),
@@ -880,7 +900,8 @@ def page_watchlist(conn):
         with st.expander(f"{name} ({status})"):
             st.write(f"**Next Air Date:** {next_air_date or 'N/A'}")
 
-            col1, col2 = st.columns(2)  # small button column + rest of header
+            col1, col2 = st.columns(2)
+
             # Remove option
             with col1:
                 if st.button(f"❌ Remove from My Shows", key=f"remove_{show_id}"):
@@ -888,7 +909,8 @@ def page_watchlist(conn):
                     conn.commit()
                     st.success(f"Removed {name} from your watchlist.")
                     st.rerun()
-            # === PLACE THE RESYNC BUTTON RIGHT HERE (per-show) ===
+
+            # Resync button
             tmdb_id_row = conn.execute(
                 "SELECT tmdb_id FROM shows WHERE id = ?",
                 (show_id,)
@@ -896,8 +918,7 @@ def page_watchlist(conn):
             tmdb_id = tmdb_id_row[0] if tmdb_id_row else None
 
             with col2:
-                if tmdb_id and st.button("🔁 Resync from TMDB", key=f"resync_{show_id}"):
-                    # Inline call (not a callback) so st.rerun() works
+                if tmdb_id and st.button("🔄 Resync from TMDB", key=f"resync_{show_id}"):
                     sync_show_from_tmdb(
                         conn,
                         tmdb_id,
@@ -905,30 +926,40 @@ def page_watchlist(conn):
                     )
                     st.success("Resynced seasons & episodes. Refreshing…")
                     st.rerun()
-            # Seasons for this show
+
+            # Get seasons for this show
             cur = conn.execute(
-                "SELECT id, season_number, episode_count FROM seasons WHERE show_id = ?",
+                """SELECT season_number, name, (SELECT COUNT(*) FROM episodes e 
+                        WHERE e.show_id = s.show_id AND e.season_number = s.season_number) as episode_count
+                        FROM seasons s 
+                        WHERE show_id = ? 
+                        ORDER BY season_number""",
                 (show_id,)
             )
             seasons = cur.fetchall()
 
-            for season_id, season_number, episode_count in seasons:
-                with st.expander(f"Season {season_number}"):
+            for season_number, season_name, episode_count in seasons:
+                with st.expander(f"Season {season_number} ({episode_count} episodes)"):
+                    # ✅ FIX: Query episodes by show_id AND season_number
                     cur = conn.execute(
-                        "SELECT id, episode_number, name, air_date FROM episodes WHERE show_id=? AND season_number=?",
+                        "SELECT id, episode_number, name, air_date FROM episodes "
+                        "WHERE show_id=? AND season_number=? ORDER BY episode_number",
                         (show_id, season_number)
                     )
-
                     episodes = cur.fetchall()
 
-                    # Watched episodes for this user
+                    if not episodes:
+                        st.warning(f"No episodes found for Season {season_number}. Try resyncing.")
+                        continue
+
+                    # ✅ FIX: Get watched episodes for this show/season
                     watched = {
                         row[0]: row for row in conn.execute(
                             "SELECT e.id, w.watched_at, w.rating, w.notes "
                             "FROM episodes e "
                             "JOIN watches w ON e.id = w.episode_id "
-                            "WHERE e.season_number= ? AND w.user_id = ? and e.show_id = ?",
-                            (season_id, user_id, show_id),
+                            "WHERE e.show_id=? AND e.season_number=? AND w.user_id=?",
+                            (show_id, season_number, user_id),
                         ).fetchall()
                     }
 
@@ -938,15 +969,38 @@ def page_watchlist(conn):
 
                         with col1:
                             st.write(f"S{season_number}E{ep_number}: {ep_name}")
-                            st.caption(f"Air date: {air_date}")
+                            st.caption(f"Air date: {air_date or 'TBA'}")
 
                         with col2:
                             if watched_entry:
                                 st.success("Watched")
                             else:
-                                if st.button("Mark Watched", key=f"watch_{episode_id}"):
-                                    log_watch(conn, episode_id)
-                                    st.rerun()
+                                # ✅ FIX: Add popover/form for rating and notes
+                                button_key = f"watch_{show_id}_{season_number}_{ep_number}"
+                                if st.button("Mark Watched", key=button_key):
+                                    st.session_state[f"show_watch_form_{episode_id}"] = True
+
+                                # Show the form if button was clicked
+                                if st.session_state.get(f"show_watch_form_{episode_id}"):
+                                    with st.form(key=f"watch_form_{episode_id}"):
+                                        st.write(f"**S{season_number}E{ep_number}: {ep_name}**")
+                                        rating = st.slider("Rating (optional)", 0, 5, 3, key=f"rating_{episode_id}")
+                                        notes = st.text_area("Notes (optional)", key=f"notes_{episode_id}")
+
+                                        col_a, col_b = st.columns(2)
+                                        with col_a:
+                                            if st.form_submit_button("Save", use_container_width=True):
+                                                try:
+                                                    log_watch(conn, episode_id, rating if rating > 0 else None, notes)
+                                                    st.session_state.pop(f"show_watch_form_{episode_id}", None)
+                                                    st.success(f"✅ Marked as watched!")
+                                                    st.rerun()
+                                                except Exception as e:
+                                                    st.error(f"Error: {e}")
+                                        with col_b:
+                                            if st.form_submit_button("Cancel", use_container_width=True):
+                                                st.session_state.pop(f"show_watch_form_{episode_id}", None)
+                                                st.rerun()
 
                         with col3:
                             if watched_entry:
@@ -955,17 +1009,32 @@ def page_watchlist(conn):
                                 st.write(f"⭐ {rating if rating else 'N/A'}")
                                 if notes:
                                     st.caption(f"Notes: {notes}")
-                                if st.button("Update Rating/Notes", key=f"edit_{episode_id}"):
+
+                                # ✅ Keep the edit functionality
+                                if st.button("Edit", key=f"edit_btn_{episode_id}"):
+                                    st.session_state[f"show_edit_form_{episode_id}"] = True
+
+                                if st.session_state.get(f"show_edit_form_{episode_id}"):
                                     with st.form(f"edit_form_{episode_id}"):
-                                        new_rating = st.slider("Rating", 1, 5, value=rating or 3)
+                                        new_rating = st.slider("Rating", 0, 5, value=rating or 3)
                                         new_notes = st.text_area("Notes", value=notes)
-                                        if st.form_submit_button("Save"):
-                                            conn.execute(
-                                                "UPDATE watches SET rating=?, notes=? WHERE user_id=? AND episode_id=?",
-                                                (new_rating, new_notes, user_id, episode_id),
-                                            )
-                                            conn.commit()
-                                            st.rerun()
+
+                                        col_a, col_b = st.columns(2)
+                                        with col_a:
+                                            if st.form_submit_button("Save"):
+                                                conn.execute(
+                                                    "UPDATE watches SET rating=?, notes=? WHERE user_id=? AND episode_id=?",
+                                                    (new_rating if new_rating > 0 else None, new_notes, user_id,
+                                                     episode_id),
+                                                )
+                                                conn.commit()
+                                                st.session_state.pop(f"show_edit_form_{episode_id}", None)
+                                                st.success("Updated!")
+                                                st.rerun()
+                                        with col_b:
+                                            if st.form_submit_button("Cancel"):
+                                                st.session_state.pop(f"show_edit_form_{episode_id}", None)
+                                                st.rerun()
 
 
 def page_next_up(conn: sqlitecloud.Connection):
