@@ -103,43 +103,73 @@ def login_screen(conn):
     tab_login, tab_signup = st.tabs(["Login", "Create Account"])
 
     with tab_login:
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
         if st.button("Login"):
-            cur = conn.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
-            row = cur.fetchone()
-            if row and check_password(password, row[1]):
-                st.session_state["user_id"] = row[0]
-                st.session_state["user_email"] = email
-                st.success("Login successful!")
-                # Run sync right after login
-                updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"],
-                                                                          sql_api_key, DEFAULT_API_KEY)
-                st.info(f"Synced {updated_count} shows • {email_count} emails • {sms_count} SMS")
-
-                st.rerun()
+            if not email or not password:
+                st.error("Please enter both email and password")
             else:
-                st.error("Invalid email or password")
+                try:
+                    cur = conn.execute("SELECT id, password_hash FROM users WHERE email = ?", (email.strip().lower(),))
+                    row = cur.fetchone()
+
+                    if not row:
+                        st.error("❌ No account found with that email")
+                    else:
+                        user_id, password_hash = row
+                        if check_password(password, password_hash):
+                            st.session_state["user_id"] = user_id
+                            st.session_state["user_email"] = email
+                            st.success("Login successful!")
+                            # Run sync right after login
+                            try:
+                                updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"],
+                                                                                      sql_api_key, DEFAULT_API_KEY)
+                                st.info(f"Synced {updated_count} shows • {email_count} emails • {sms_count} SMS")
+                            except Exception as e:
+                                st.warning(f"Sync failed: {e}")
+                            st.rerun()
+                        else:
+                            st.error("Invalid email or password")
+                except Exception as e:
+                    st.error(f"Login error: {e}")
 
     with tab_signup:
         email = st.text_input("New Email", key="signup_email")
         password = st.text_input("New Password", type="password", key="signup_password")
-        phone = st.text_input("Phone (optional)")
-        carrier = st.selectbox("Carrier", ["", "AT&T", "Verizon", "T-Mobile", "Sprint"])
-        enable_email = st.checkbox("Enable Email Alerts", value=True)
-        enable_sms = st.checkbox("Enable SMS Alerts")
+        phone = st.text_input("Phone (optional)", key="signup_phone")
+        carrier = st.selectbox("Carrier", ["", "AT&T", "Verizon", "T-Mobile", "Sprint"], key="signup_carrier")
+        enable_email = st.checkbox("Enable Email Alerts", value=True, key="signup_enable_email")
+        enable_sms = st.checkbox("Enable SMS Alerts", key="signup_enable_sms")
 
         if st.button("Create Account"):
-            try:
-                conn.execute(
-                    "INSERT INTO users (email, phone, carrier, enable_email, enable_sms, password_hash) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (email, phone, carrier, int(enable_email), int(enable_sms), hash_password(password)),
-                )
-                conn.commit()
-                st.success("Account created! Please login.")
-            except Exception as e:
-                st.error(f"Error creating account: {e}")
+            if not email or not password:
+                st.error("Email and password are required")
+            elif len(password) < 6:
+                st.error("Password must be at least 6 characters")
+            else:
+                try:
+                    # ✅ Normalize email before storing
+                    normalized_email = email.strip().lower()
+
+                    # Check if email already exists
+                    existing = conn.execute("SELECT id FROM users WHERE email = ?", (normalized_email,)).fetchone()
+                    if existing:
+                        st.error("An account with this email already exists")
+                    else:
+                        conn.execute(
+                            "INSERT INTO users (email, phone, carrier, enable_email, enable_sms, password_hash) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (normalized_email, phone or None, carrier or None, int(enable_email), int(enable_sms),
+                             hash_password(password)),
+                        )
+                        conn.commit()
+                        st.success("✅ Account created! Please login with your credentials.")
+                except Exception as e:
+                    st.error(f"Error creating account: {e}")
+                    # ✅ Show more details for debugging
+                    if "UNIQUE constraint failed" in str(e):
+                        st.error("This email is already registered")
 
 
 def logout():
