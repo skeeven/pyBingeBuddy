@@ -120,6 +120,19 @@ def login_screen(conn):
                         if check_password(password, password_hash):
                             st.session_state["user_id"] = user_id
                             st.session_state["user_email"] = email
+
+                            # Update last_login (UTC) and increment count atomically
+                            conn.execute(
+                                """
+                                UPDATE users
+                                SET last_login = CURRENT_TIMESTAMP,
+                                    login_count = COALESCE(login_count, 0) + 1
+                                WHERE id = ?
+                                """,
+                                (user_id,),
+                            )
+                            conn.commit()
+
                             st.success("Login successful!")
                             # Run sync right after login
                             try:
