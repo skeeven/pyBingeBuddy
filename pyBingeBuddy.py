@@ -136,8 +136,9 @@ def login_screen(conn):
                             st.success("Login successful!")
                             # Run sync right after login
                             try:
-                                updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"],
-                                                                                      sql_api_key, DEFAULT_API_KEY)
+                                updated_count, email_count, sms_count = sync_show_updates(conn,
+                                                                                          st.session_state["user_id"],
+                                                                                          sql_api_key, DEFAULT_API_KEY)
                                 st.info(f"Synced {updated_count} shows • {email_count} emails • {sms_count} SMS")
                             except Exception as e:
                                 st.warning(f"Sync failed: {e}")
@@ -1142,6 +1143,7 @@ def sync_show_updates(conn, user_id: int, api_key: str, t_api_key: str):
         try:
             details = tmdb_tv_details(tmdb_id, t_api_key) or {}
             status = details.get("status", "Unknown")
+            next_air_date = None
             new_air_date = details.get("next_episode_to_air", {}).get("air_date")
 
             # Only update if changed
@@ -1246,7 +1248,8 @@ def page_alerts(conn):
     # Manual sync with TMDB
     st.subheader("Check for Show Updates")
     if st.button("Check Now"):
-        updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"], sql_api_key, DEFAULT_API_KEY)
+        updated_count, email_count, sms_count = sync_show_updates(conn, st.session_state["user_id"],
+                                                                  sql_api_key, DEFAULT_API_KEY)
         st.info(f"Updated shows: {updated_count} • Emails sent: {email_count} • SMS sent: {sms_count}")
 
 
@@ -1280,8 +1283,9 @@ def main():
             st.caption(f"Signed in as: {st.session_state.get('user_email', 'Unknown')}")
             # IMPORTANT: inline button (NO on_click), so st.rerun() in logout() is not in a callback
             # if st.button("Sync Databases", use_container_width=True):
-            #    sync_show_from_tmdb(st.session_state.get("conn"), st.session_state.get(""), st.session_state.get("api_key") )
-                # conn: sqlitecloud.Connection, tmdb_id: int, api_key
+            #    sync_show_from_tmdb(st.session_state.get("conn"), st.session_state.get(""),
+            #    st.session_state.get("api_key") )
+            # conn: sqlitecloud.Connection, tmdb_id: int, api_key
             if st.button("🔄 Sync All Shows", use_container_width=True):
                 conn = st.session_state.get("conn")
                 api_key = st.session_state.get("api_key") or DEFAULT_API_KEY
