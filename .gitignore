@@ -1,0 +1,36 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Pygame assets (optional)
+*.wav
+*.mp3
+*.ogg
+*.png
+*.jpg
+
+# Logs and temp files
+*.log
+*.tmp
+
+# IDE configs
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+
+# SQLiteCloud credentials (if any)
+*.db
+*.sqlite
+
+secrets.toml
