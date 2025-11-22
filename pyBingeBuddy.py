@@ -32,12 +32,31 @@ except ImportError:
     pass
 
 
-def _get_secret(key: str, default: str = "") -> str:
-    # tolerate missing st.secrets during local runs
+def _get_secret(key: str, default=None):
+    """
+    Load a secret from:
+      1) Environment variables (GitHub Actions, .env, Streamlit Cloud env)
+      2) Streamlit secrets (only if available and configured)
+      3) Fallback default
+    Never raises if secrets.toml is missing.
+    """
+    val = os.getenv(key)
+    if val not in (None, ""):
+        return val
+
     try:
-        return os.getenv(key) or st.secrets.get(key, default)
-    except ImportError:
-        return default
+        import streamlit as st  # optional in headless
+        # Only read st.secrets if it exists *and* has the key
+        if hasattr(st, "secrets"):
+            # st.secrets behaves like a mapping, but accessing ._parse() without a file raises.
+            # Using "in" avoids raising; if secrets.toml is absent this just returns False.
+            if key in st.secrets:
+                return st.secrets[key]
+    except Exception:
+        # Any Streamlit import/secrets errors are ignored in headless use
+        pass
+
+    return default
 
 
 # environment debug
