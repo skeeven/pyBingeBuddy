@@ -10,6 +10,7 @@ import bcrypt
 import streamlit as st
 from urllib.parse import urlparse, urlunparse
 import re
+from pathlib import Path
 
 # Optional SMS
 # try:
@@ -1257,12 +1258,25 @@ def page_alerts(conn):
 # Main
 # ----------------------------
 def main():
-    st.set_page_config(page_title="Show Tracker", layout="wide")
-    st.title("📺 Personal Show Tracker")
-    st.write("Environment: ", ENVIRON)
+    st.set_page_config(page_title="Binge Buddy", layout="wide")
+    img_paths = ["images/binge_buddy_profile.png", "/mnt/data/binge_buddy_profile.png"]
+    img_path = next((p for p in img_paths if Path(p).exists()), None)
+
+    col_logo, col_text = st.columns([0.05, 1], vertical_alignment="center")
+
+    with col_logo:
+        if img_path:
+            st.image(img_path, width=48)  # small logo
+        else:
+            st.write("🅱")  # tiny fallback glyph
+
+    with col_text:
+        st.markdown("### Binge Buddy")
+        st.caption("Personal Show Tracker")
 
     with st.sidebar:
         if DEBUG_ON:
+            st.write("Environment: ", ENVIRON)
             st.markdown("### Settings")
             api_key = st.text_input("TMDB API Key", value=DEFAULT_API_KEY, type="password")
             st.session_state["api_key"] = api_key
