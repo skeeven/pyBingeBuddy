@@ -138,7 +138,7 @@ def upcoming_for_user(
     JOIN user_shows us
       ON us.show_id = e.show_id
      AND us.user_id = ?
-    LEFT JOIN user_episode_watched w
+    LEFT JOIN watches w
       ON w.user_id = ?
      AND w.episode_id = e.id
     WHERE w.episode_id IS NULL
